@@ -26,13 +26,13 @@
         <meta-data
             android:name="xposedminversion"
             android:value="82" />
-        <!-- v1.21 起不再声明 xposedsharedprefs：LSPosed 的「New XSharedPreferences」
-             已被官方标记废弃（模块页会出现"此模块使用了已废弃且即将移除的功能"警告），
-             计划 2.3.0 正式移除；且非该机制下跨应用直读 /data/data 私有目录不可行。
-             开关配置改由本模块自带的只读 ContentProvider 传递：
-             Hook 侧（两步路进程）查询 content://com.sumver.tbulu.prefs/settings，
-             不依赖任何 LSPosed 私有机制，1.9.x / 2.x 及以后版本通用
-             （见 Prefs / PrefsProvider）。 -->
+        <!-- 配置通道不使用 LSPosed 的 xposedsharedprefs / XSharedPreferences：
+             真机（LSPosed 2.2.1 / API 102）实测该机制运行期已不向模块暴露
+             （de.robv.android.xposed.XSharedPreferences → ClassNotFoundException），
+             声明了只会让模块页出现"使用已废弃功能"的警告。
+             当前方案（v1.32）：主通道 = 宿主应用本地偏好（两步路内「模块设置」弹窗写入，
+             同进程、不经过任何跨进程策略）；辅通道 = 本模块的只读 ContentProvider
+             （MIUI 会以自启动名义拦截冷启动，见 Prefs.loadSnapshot 注释）。 -->
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />

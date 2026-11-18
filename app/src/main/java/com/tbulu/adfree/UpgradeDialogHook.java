@@ -25,7 +25,8 @@ import de.robv.android.xposed.XposedHelpers;
 final class UpgradeDialogHook {
 
     private static final String UPGRADE_MANAGER = "com.lolaage.tbulu.tools.upgrade.OooO0o";
-    private static final String SETUP_FRAGMENT = "com.lolaage.tbulu.tools.ui.fragment.main.o0000";
+    /** “我的”页 Fragment：类名按版本档案走（9.2.9 = o0000 / SetUpFragment，9.3.0 = SetUpFragment）。 */
+    private static final String SETUP_FRAGMENT_FALLBACK = "com.lolaage.tbulu.tools.ui.fragment.main.o0000";
 
     private UpgradeDialogHook() {
     }
@@ -35,7 +36,7 @@ final class UpgradeDialogHook {
         return Prefs.isEnabled(Prefs.K_UPGRADE);
     }
 
-    static void install(ClassLoader cl) {
+    static void install(ClassLoader cl, TargetProfile profile) {
         // 1) UpgradeInfoDialog 唯一展示入口
         Class<?> manager = findClassSafe(cl, UPGRADE_MANAGER);
         if (manager != null) {
@@ -51,9 +52,23 @@ final class UpgradeDialogHook {
             });
         }
 
-        // 2) 我的页"更新提示弹窗"唯一入口
-        Class<?> fragment = findClassSafe(cl, SETUP_FRAGMENT);
-        if (fragment != null) {
+        // 2) “我的”页“更新提示弹窗”唯一入口：按版本档案给出候选类
+        java.util.List<String> fragmentNames = new java.util.ArrayList<>();
+        if (profile != null) {
+            for (String name : profile.fragmentNames) {
+                if (!fragmentNames.contains(name)) {
+                    fragmentNames.add(name);
+                }
+            }
+        }
+        if (!fragmentNames.contains(SETUP_FRAGMENT_FALLBACK)) {
+            fragmentNames.add(SETUP_FRAGMENT_FALLBACK);
+        }
+        for (String name : fragmentNames) {
+            Class<?> fragment = findClassSafe(cl, name);
+            if (fragment == null) {
+                continue;
+            }
             hookAllSafe(fragment, "o0000oo0", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {

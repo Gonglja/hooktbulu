@@ -17,21 +17,28 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 功能开关配置（模块设置界面 ↔ Hook 进程的桥梁）。
+ * 功能开关配置（模块 App ↔ Hook 进程的桥梁）。
  *
- * 通道协议（v1.21 起，替代 LSPosed 已废弃的「New XSharedPreferences」）：
- *  - 模块 App 进程：设置界面以 {@link Context#MODE_PRIVATE} 正常读写偏好文件（settings），
- *    并通过只读 ContentProvider（{@link PrefsProvider}，authority 见 {@link #PROVIDER_AUTHORITY}）
- *    把 Boolean 开关暴露给外部查询；
- *  - Hook（两步路）进程：启动后**异步**经 ContentResolver 查询
- *    content://com.sumver.tbulu.prefs/settings（首次查询会拉起模块 App 进程），
- *    成功后把整份配置缓存到进程内存；查询期间 / 查询失败时按内置默认值行事
- *    （普通开关开启，「隐藏坚持运动天数」「隐藏消息未读数」默认关闭），不阻塞两步路启动。
- *  - 该通道是标准 Android IPC，不依赖任何 LSPosed 私有机制：
- *    LSPosed 的 New XSharedPreferences 已被官方标记废弃（计划 2.3.0 移除），故弃用；
- *    1.9.x / 2.x 及以后版本通用。
- *  - 读取策略：**每个进程只加载一次**。因此开关修改后必须重启（强制停止）两步路才生效
- *    —— 刻意设计，避免运行中状态错乱。
+ * 设计原则（v1.32 修订）：**不向两步路（官方 App）自己的数据目录写任何东西**。
+ * 配置只存在于模块 App（com.sumver.tbulu）的私有偏好文件 settings 里，
+ * Hook 进程通过标准 Android IPC 读取 / 回写。
+ *
+ * 通道：
+ *  - 模块 App 侧：{@link Context#MODE_PRIVATE} 读写 settings，并通过只读 ContentProvider
+ *    （{@link PrefsProvider}，authority 见 {@link #PROVIDER_AUTHORITY}）对外暴露 Boolean 开关；
+ *  - Hook（两步路）侧：进程启动后异步查询 content://com.sumver.tbulu.prefs/settings，
+ *    成功后缓存到进程内存；查询失败则按内置默认值行事，不阻塞两步路启动。
+ *
+ * 已知环境问题（真机 Xiaomi 15 Ultra / HyperOS + LSPosed 2.2.1）：
+ *  - MIUI 会以「自启动」名义拦截「两步路 → 模块 App」的 provider 冷启动：
+ *      WakePathChecker: MIUILOG-AutoStart ... Reject caller=com.lolaage.tbulu.tools
+ *                       callee=com.sumver.tbulu classname=com.tbulu.adfree.PrefsProvider
+ *    对策：把模块 App 加入 MIUI 自启动/后台白名单（或先打开一次模块 App 让它常驻）。
+ *  - LSPosed 的 XSharedPreferences 在 2.2.1 运行期直接 ClassNotFoundException
+ *    （不再向模块暴露该类），故不作为通道，模块也不再声明 xposedsharedprefs。
+ *
+ * 读取策略：**每个进程只加载一次**。因此开关修改后必须重启（强制停止）两步路才生效
+ * —— 刻意设计，避免运行中状态错乱（弹窗里改完会提示）。
  */
 final class Prefs {
 
@@ -231,13 +238,13 @@ final class Prefs {
         try {
             if (MODULE_PKG.equals(context.getPackageName())) {
                 ui(context).edit().putBoolean(key, value).apply();
-                XposedInit.log("Prefs: " + key + " = " + value + " persisted (local)");
+                debugLog(key + " = " + value + " persisted (module app local)");
                 return;
             }
             if (!isModuleAppInstalled(context)) {
-                // 并入单 APK / LSPatch 本地模式：无独立模块 App，直接写宿主本地
+                // 并入单 APK / LSPatch 本地模式：没有独立模块 App，只能写宿主本地
                 hostPrefs(context).edit().putBoolean(key, value).apply();
-                XposedInit.log("Prefs: " + key + " = " + value + " persisted (host-local)");
+                debugLog(key + " = " + value + " persisted (host-local; merged single-APK mode)");
                 return;
             }
             ContentValues values = new ContentValues();
@@ -245,21 +252,13 @@ final class Prefs {
             values.put(COLUMN_VALUE, value ? 1 : 0);
             int rows = context.getContentResolver().update(PROVIDER_URI, values, null, null);
             if (rows > 0) {
-                XposedInit.log("Prefs: " + key + " = " + value + " persisted (rows=" + rows + ")");
-                return;
+                debugLog(key + " = " + value + " persisted to module app");
+            } else {
+                debugLog(key + " = " + value + " NOT persisted: module app provider rejected"
+                        + " (check MIUI autostart/background permission for " + MODULE_PKG + ")");
             }
-            // provider 写不进去（并入单 APK / LSPatch 本地模式：无独立模块 App 进程）
-            hostPrefs(context).edit().putBoolean(key, value).apply();
-            XposedInit.log("Prefs: " + key + " = " + value + " persisted (host-local; provider unavailable)");
         } catch (Throwable t) {
-            // provider 不可达等：兜底写宿主本地，保证重启后仍保留
-            try {
-                hostPrefs(context).edit().putBoolean(key, value).apply();
-                XposedInit.log("Prefs: " + key + " = " + value
-                        + " persisted (host-local fallback after error)");
-            } catch (Throwable t2) {
-                XposedInit.log("Prefs: persist failed for " + key + "=" + value + ": " + t2);
-            }
+            debugLog("persist failed " + key + "=" + value + ": " + t);
         }
     }
 
@@ -292,7 +291,7 @@ final class Prefs {
         Thread loader = new Thread(new Runnable() {
             @Override
             public void run() {
-                loadFromProvider();
+                loadSnapshot();
             }
         }, "TbuluAdFree-Prefs");
         loader.setDaemon(true);
@@ -300,55 +299,48 @@ final class Prefs {
     }
 
     /**
-     * 后台加载：等 Application 就绪 → 查询模块 App 的只读 ContentProvider → 填充快照。
-     * provider 不可用时（例如并入单个 APK / LSPatch 本地模式：没有独立模块 App 进程），
-     * 回退读取**宿主应用本地**的 {@link #HOST_FILE}；仍无配置则用内置默认值。
+     * 后台加载：从模块 App 的只读 ContentProvider 取整份开关快照（每个进程只做一次）。
+     *
+     * 不读取（也不写入）两步路自己的偏好文件 —— 配置只属于模块 App。
+     * 唯一例外：并入单 APK / LSPatch 本地模式（**没有**独立模块 App）时，配置只能落在宿主
+     * 本地偏好里，那是该产品形态下唯一可行的位置。
+     *
+     * 查询失败（典型原因：MIUI 自启动拦截）→ 空快照 → 全部走内置默认值，不影响 App 运行。
      */
-    private static void loadFromProvider() {
-        Application lastApp = null;
-        // 先判断是否存在独立模块 App：不存在（并入单 APK / LSPatch 本地模式）则直接读宿主本地，
-        // 避免在无 provider 的环境里白白重试、拖慢配置就绪。
-        Application app0 = waitForApplication();
-        if (app0 != null && !isModuleAppInstalled(app0)) {
-            Map<String, Boolean> local = readHostPrefs(app0);
+    private static void loadSnapshot() {
+        Map<String, Boolean> loaded = new HashMap<>();
+        Application app = waitForApplication();
+        if (app == null) {
+            debugLog("Application not ready; built-in defaults");
+            sSnapshot = loaded;
+            return;
+        }
+
+        if (!isModuleAppInstalled(app)) {
+            // 并入单 APK / LSPatch 本地模式：没有独立模块 App，只能读宿主本地
+            Map<String, Boolean> local = readHostPrefs(app);
             sSnapshot = local;
-            XposedInit.log("Prefs: module app absent; loaded " + local.size()
+            debugLog("module app absent; loaded " + local.size()
                     + " switches via host-local prefs (merged single-APK mode)");
             return;
         }
-        lastApp = app0;
 
         for (int attempt = 1; attempt <= MAX_LOAD_ATTEMPTS; attempt++) {
-            Application app = waitForApplication();
-            if (app == null) {
-                // Application 尚未创建（进程启动很早）：稍等再试
-                sleepQuietly(400L);
-                continue;
+            Map<String, Boolean> fromApp = queryProvider(app);
+            if (fromApp != null) {
+                loaded.putAll(fromApp);
+                break;
             }
-            lastApp = app;
-            Map<String, Boolean> loaded = queryProvider(app);
-            if (loaded != null) {
-                sSnapshot = loaded;
-                XposedInit.log("Prefs: loaded " + loaded.size()
-                        + " switches via PrefsProvider (read once per process; restart target app to apply)");
-                return;
+            debugLog("PrefsProvider attempt " + attempt + " failed"
+                    + " (check MIUI autostart/background permission for " + MODULE_PKG + ")");
+            if (attempt < MAX_LOAD_ATTEMPTS) {
+                sleepQuietly(300L * attempt);
             }
-            sleepQuietly(300L * attempt);
         }
 
-        // provider 不可用：尝试宿主应用本地配置（并入单 APK / LSPatch 本地模式的场景）
-        Map<String, Boolean> local = lastApp == null ? null : readHostPrefs(lastApp);
-        if (local != null && !local.isEmpty()) {
-            sSnapshot = local;
-            XposedInit.log("Prefs: loaded " + local.size()
-                    + " switches via host-local prefs (no module provider; merged single-APK mode)");
-            return;
-        }
-
-        sSnapshot = Collections.emptyMap();
-        XposedInit.log("Prefs: provider unavailable after " + MAX_LOAD_ATTEMPTS
-                + " attempts; 回退内置默认值（普通开关开启，「隐藏坚持运动天数」「隐藏消息未读数」默认关闭）。"
-                + "请确认模块 App 已安装，并打开过一次模块设置界面");
+        sSnapshot = loaded;
+        debugLog("snapshot ready: " + loaded.size() + " switches"
+                + (loaded.isEmpty() ? " (built-in defaults)" : " (from module app)"));
     }
 
     /** 读取宿主应用本地配置（并入单 APK 场景；只认已知 switch key）。 */
@@ -435,6 +427,22 @@ final class Prefs {
         }
         sProviderErrorLogged = true;
         XposedInit.log("Prefs: provider query failed: " + reason);
+    }
+
+    /**
+     * 同时写 logcat（tag = TbuluAdFree）与 XposedBridge 日志。
+     *
+     * 配置通道是否生效只有运行期才能看出来（MIUI 拦截 provider、XSharedPreferences 是否可用），
+     * 而 XposedBridge 日志需要 root 才能读；logcat 里的目标进程日志普通 adb 就能看，
+     * 排查“开关为什么不生效”时直接用 `adb logcat -s TbuluAdFree` 即可。
+     */
+    private static void debugLog(String msg) {
+        try {
+            // 注意：HyperOS/MIUI 会过滤第三方应用的 INFO 级日志，这里用 WARN 才能在 logcat 看到
+            android.util.Log.w("TbuluAdFree", "Prefs: " + msg);
+        } catch (Throwable ignored) {
+        }
+        XposedInit.log("Prefs: " + msg);
     }
 
     private static void sleepQuietly(long millis) {

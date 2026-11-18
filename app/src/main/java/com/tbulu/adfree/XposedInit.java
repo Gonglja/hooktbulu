@@ -12,7 +12,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 /**
  * LSPosed / EdXposed 模块入口。
  *
- * 目标：com.lolaage.tbulu.tools（两步路）v9.2.8 (versionCode 1652)
+ * 目标：com.lolaage.tbulu.tools（两步路）
+ *      9.2.8 = versionCode 1652 / 9.2.9 = 1656 / 9.3.0 = 1665
  * 作用：隐藏信息流/列表/详情页的广告位、"我的"页的会员促销横幅；
  *       v1.6 起新增"会员本地门控解锁"（DIY首页/图片水印/头像挂件/专属样式/个性化分享）。
  *       不伪造账号 VIP 状态、不拦截网络请求、不动购买流程（详见各 Hook 类注释）。
@@ -21,8 +22,8 @@ public class XposedInit implements IXposedHookLoadPackage {
 
     public static final String TAG = "TbuluAdFree";
     public static final String TARGET_PKG = "com.lolaage.tbulu.tools";
-    /** 9.2.8 => versionCode 1652；9.2.9 => 1656；仅作提示，不做硬性拦截。 */
-    public static final int TARGET_VERSION_CODE = 1656;
+    /** 9.2.8 => versionCode 1652；9.2.9 => 1656；9.3.0 => 1665；仅作提示，不做硬性拦截。 */
+    public static final int TARGET_VERSION_CODE = 1665;
 
     /**
      * 9.2.9 起目标 App 使用百度加固（StubApplication + assets/baiduprotect*.dex），
@@ -98,13 +99,17 @@ public class XposedInit implements IXposedHookLoadPackage {
             return;
         }
         int versionCode;
+        String versionName = null;
         try {
-            versionCode = app.getPackageManager().getPackageInfo(TARGET_PKG, 0).versionCode;
+            PackageInfo pi = app.getPackageManager().getPackageInfo(TARGET_PKG, 0);
+            versionCode = pi.versionCode;
+            versionName = pi.versionName;
         } catch (Throwable t) {
             log("read versionCode failed: " + t);
             return;
         }
-        TargetProfile profile = TargetProfile.forVersion(versionCode);
+        // versionName 优先：9.2.9 的旧 versionCode 区间上限（1665）与 9.3.0（1665）撞车
+        TargetProfile profile = TargetProfile.forVersion(versionCode, versionName);
         ClassLoader cl = app.getClassLoader();
         if (cl == null) {
             return;
@@ -119,12 +124,48 @@ public class XposedInit implements IXposedHookLoadPackage {
             return;
         }
         sHooksInstalled = true;
+        sClassLoader = cl;
         // ScanHook 为临时运行时类扫描工具，9.2.9 定位完成后不再执行（保留代码备用）。
         // try { ScanHook.scan(cl); } catch (Throwable t) { log("scan failed: " + t); }
         log("probe class resolved, installing hooks with classLoader=" + cl);
-        log("target app versionCode=" + versionCode + ", profile=" + profile.describe()
+        log("target app version=" + versionName + " (" + versionCode + "), profile=" + profile.describe()
                 + (profile.known ? "" : " (unsupported version, best-effort)"));
         installAll(cl, profile);
+        installLateRetryHook();
+    }
+
+    /** 已安装 Hook 的目标 ClassLoader（供延迟补装使用）。 */
+    private static volatile ClassLoader sClassLoader;
+    private static volatile boolean sLateRetryHooked;
+
+    /**
+     * 延迟补装：百度加固的 data dex 是懒追加到 DexPathList 的，
+     * 启动早期部分类（如 AdConfigManager）可能还解析不到。这里在 Activity 回到前台时幂等重试，
+     * 让“开屏广告配置跳过”等 hook 能在同一个进程内后续生效（不需要重启）。
+     */
+    private static void installLateRetryHook() {
+        if (sLateRetryHooked) {
+            return;
+        }
+        sLateRetryHooked = true;
+        try {
+            XposedHelpers.findAndHookMethod(android.app.Activity.class, "onResume",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ClassLoader cl = sClassLoader;
+                            if (cl == null) {
+                                return;
+                            }
+                            try {
+                                AdsHook.retrySplashConfig(cl);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            log("late retry hook setup failed: " + t);
+        }
     }
 
     /** 取目标进程的 Application（优先 AndroidAppHelper，其次 ActivityThread）。 */
@@ -175,12 +216,12 @@ public class XposedInit implements IXposedHookLoadPackage {
             log("EquipmentTabHook install failed: " + t);
         }
         try {
-            UpgradeDialogHook.install(cl);
+            UpgradeDialogHook.install(cl, profile);
         } catch (Throwable t) {
             log("UpgradeDialogHook install failed: " + t);
         }
         try {
-            AdsHook.install(cl);
+            AdsHook.install(cl, profile);
         } catch (Throwable t) {
             log("AdsHook install failed: " + t);
         }

@@ -108,9 +108,17 @@ final class VipGateUnlockHook {
             return; // 所有解锁都依赖该单例，找不到就整体跳过
         }
         try {
-            hookScopedVip(auth, M_VIP_OR_SVIP);
-            hookScopedVip(auth, M_SVIP);
-            XposedInit.log("VipGateUnlockHook: member-check singleton hooked (" + auth.getName() + ")");
+            // 方法名按版本档案取（9.2.8/9.2.9 = OooOooO；9.3.0 = OooOooo）
+            int hooked = 0;
+            hooked += hookScopedVipAll(auth, profile.vipOrSvipMethodNames, M_VIP_OR_SVIP);
+            hooked += hookScopedVipAll(auth, profile.svipMethodNames, M_SVIP);
+            if (hooked == 0) {
+                XposedInit.log("VipGateUnlockHook: member-check methods not found on "
+                        + auth.getName() + ", skip VIP unlocking.");
+                return; // 会员判断方法都不在，解锁整体失效（不影响 App 运行）
+            }
+            XposedInit.log("VipGateUnlockHook: member-check singleton hooked ("
+                    + auth.getName() + ", " + hooked + " method(s))");
         } catch (Throwable t) {
             XposedInit.log("VipGateUnlockHook: member-check singleton hook failed: " + t);
             return;
@@ -178,12 +186,52 @@ final class VipGateUnlockHook {
     // 会员判断单例：作用域内翻转
     // ------------------------------------------------------------------
 
-    private static void hookScopedVip(Class<?> auth, final String method) {
+    /** 按档案候选逐个安装“作用域内会员判断置真”的 hook，返回成功安装次数。 */
+    private static int hookScopedVipAll(Class<?> auth, String[] candidates, String fallback) {
+        int hooked = 0;
+        String[] names = (candidates == null || candidates.length == 0)
+                ? new String[]{fallback} : candidates;
+        java.util.Set<String> done = new java.util.HashSet<>();
+        for (String name : names) {
+            if (name == null || !done.add(name)) {
+                continue;
+            }
+            if (hookScopedVip(auth, name)) {
+                hooked++;
+            }
+        }
+        return hooked;
+    }
+
+    /**
+     * 会员判断单例：作用域内临时返回 true。
+     *
+     * 只接受「无参 -> boolean」的方法：9.3.0 的 o00O0ooo.Oooo0 里同时存在
+     * {@code OooOooO(J)Z}（带参的其他校验），按名字盲 hook 会误伤。
+     */
+    private static boolean hookScopedVip(Class<?> auth, final String method) {
         try {
+            // 先按签名确认「无参 -> boolean」方法存在，再安装 hook（避免误挂同名带参方法）
+            boolean matched = false;
+            for (java.lang.reflect.Method m : auth.getDeclaredMethods()) {
+                if (m.getName().equals(method) && m.getParameterTypes().length == 0
+                        && m.getReturnType() == boolean.class) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                XposedInit.log("VipGateUnlockHook: " + auth.getSimpleName() + "." + method
+                        + " has no ()Z variant");
+                return false;
+            }
             XposedBridge.hookAllMethods(auth, method, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (!inScope() || param.getThrowable() != null) {
+                        return;
+                    }
+                    if (!isNoArgBoolean(param)) {
                         return;
                     }
                     Object result = param.getResult();
@@ -195,9 +243,20 @@ final class VipGateUnlockHook {
                 }
             });
             XposedInit.log("VipGateUnlockHook: hooked " + auth.getSimpleName() + "." + method + " (scoped)");
+            return true;
         } catch (Throwable t) {
             XposedInit.log("VipGateUnlockHook: hook " + method + " failed: " + t);
+            return false;
         }
+    }
+
+    /** 是否为「无参 -> boolean」方法（用于避免误伤同名带参方法）。 */
+    private static boolean isNoArgBoolean(XC_MethodHook.MethodHookParam param) {
+        if (param.args != null && param.args.length != 0) {
+            return false;
+        }
+        return !(param.method instanceof java.lang.reflect.Method)
+                || ((java.lang.reflect.Method) param.method).getReturnType() == boolean.class;
     }
 
     // ------------------------------------------------------------------

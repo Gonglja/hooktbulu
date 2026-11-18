@@ -14,14 +14,14 @@ def hasReleaseSigning = localProps.getProperty('release.storeFile') != null &&
 
 android {
     namespace 'com.tbulu.adfree'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId "com.sumver.tbulu"
         minSdk 26
         targetSdk 34
-        versionCode 30
-        versionName "1.30"
+        versionCode 32
+        versionName "1.32"
     }
 
     signingConfigs {

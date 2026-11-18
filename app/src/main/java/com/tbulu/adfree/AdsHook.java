@@ -63,6 +63,9 @@ final class AdsHook {
     private static volatile Set<Integer> sAdContainerIds;
     private static final Set<String> sLoggedClasses = new HashSet<>();
 
+    /** 当前版本档案（决定开屏广告是“掐断入口”还是“走配置跳过”）。 */
+    private static volatile TargetProfile sProfile;
+
     private AdsHook() {
     }
 
@@ -71,7 +74,8 @@ final class AdsHook {
         return Prefs.isEnabled(Prefs.K_ADS);
     }
 
-    static void install(ClassLoader cl) {
+    static void install(ClassLoader cl, TargetProfile profile) {
+        sProfile = profile;
         installViewGuards();
         installSplash(cl);
         installFeedAd(cl);
@@ -196,6 +200,13 @@ final class AdsHook {
             "com.lolaage.tbulu.tools.ui.fragment.WelcomeNormalFragment";
 
     private static void installSplash(ClassLoader cl) {
+        TargetProfile profile = sProfile;
+        boolean suppressEntry = profile == null || profile.suppressSplashEntry;
+        if (!suppressEntry) {
+            installSplashByConfig(cl);
+            return;
+        }
+        // ---- 9.2.8 / 9.2.9：App 另有独立计时器进入主界面，可以安全地掐断展示入口 ----
         Class<?> fragment = findClassSafe(cl, WELCOME_FRAGMENT);
         if (fragment != null) {
             // Oooo0O0() = 展示三方开屏广告（TopOn/taku）的调度入口
@@ -229,8 +240,76 @@ final class AdsHook {
     }
 
     /**
+     * 9.3.0+：**只**走 App 自带的「本次不展示开屏广告」分支，绝不掐断展示入口。
+     *
+     * 9.3.0 实测链路（内存 dex 反编译）：
+     *   WelcomeActivity.OoooO0()
+     *     → new WelcomeNormalFragment()
+     *     → fragment.Oooo0O0(new oOo00o00(activity))   // 注册“开屏结束”回调
+     *     → FragmentTransaction.replace(...).commitAllowingStateLoss()
+     *   WelcomeNormalFragment.Oooo0O0(WelcomeNormalFragment$OooO0O0 listener)
+     *     → 展示开屏广告，结束后回调 listener.OooO00o(Z)
+     *
+     * 旧实现（9.2.8/9.2.9）把 Oooo0O0 / Oooo0 直接 setResult(null) 掐掉，等于把
+     * “注册回调 + 广告结束”一起抹掉：listener 永不触发 → WelcomeActivity 永不结束
+     * → 用户看到的就是「启动卡在第一页」（开屏页），主线程空闲、只剩开屏动画在跑。
+     *
+     * 因此 9.3.0 起改为：
+     *   1) hook AdConfigManager.isNeedShowSplashAdThisTime() → false（App 自己的“本次不展示”分支，
+     *      OooOoo()I 判定为跳过原因后仍会正常收尾进入主界面）；
+     *   2) 广告视图仍由通用守卫（按类名/容器 id）隐藏，用户看不到广告位。
+     * 兜底：配置类解析不到时什么都不做 —— 广告会正常展示并正常结束，但绝不会卡死。
+     */
+    private static void installSplashByConfig(ClassLoader cl) {
+        Class<?> cfg = findClassSafe(cl, "com.lolaage.tbulu.tools.business.managers.AdConfigManager");
+        if (cfg == null) {
+            logCat("splash: AdConfigManager NOT resolved yet; keep original splash flow (never hang)");
+            return;
+        }
+        hookAllSafe(cfg, "isNeedShowSplashAdThisTime", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (!enabled()) {
+                    return;
+                }
+                param.setResult(Boolean.FALSE);
+                XposedInit.log("splash ad skipped by config (isNeedShowSplashAdThisTime -> false)");
+            }
+        });
+        logCat("splash: AdConfigManager resolved, isNeedShowSplashAdThisTime hooked");
+        sSplashConfigHooked = true;
+    }
+
+    /** 广告配置类是否已经 hook 上（百度加固的 dex 懒加载，首次可能解析不到）。 */
+    private static volatile boolean sSplashConfigHooked;
+
+    /**
+     * 延迟补装开屏“配置跳过”hook。
+     *
+     * 百度加固会按需把 data dex 追加到 DexPathList，启动早期 {@code AdConfigManager}
+     * 可能还解析不到；等 App 自己跑过一轮开屏流程后它就已加载，此时补装即可
+     * （后续从后台回前台/二次进开屏都会命中）。幂等，可由 Activity 生命周期重复调用。
+     */
+    static void retrySplashConfig(ClassLoader cl) {
+        if (sSplashConfigHooked || cl == null) {
+            return;
+        }
+        TargetProfile profile = sProfile;
+        if (profile != null && profile.suppressSplashEntry) {
+            return; // 旧版本走入口掐断，不需要配置 hook
+        }
+        try {
+            installSplashByConfig(cl);
+        } catch (Throwable t) {
+            XposedInit.log("splash config retry failed: " + t);
+        }
+    }
+
+    /**
      * 走 App 自带的"跳过开屏广告"路径（OooOoo()：清理广告视图并回调进入主界面），
      * 等价于用户点击跳过或广告无填充，不影响任何业务功能。
+     *
+     * 仅用于 {@link TargetProfile#suppressSplashEntry} = true 的旧版本（9.2.8/9.2.9）。
      */
     private static void skipSplash(XC_MethodHook.MethodHookParam param) {
         if (!enabled()) {
@@ -459,6 +538,15 @@ final class AdsHook {
     }
 
     /* ============================ 工具 ============================ */
+
+    /** logcat 可见（WARN 级；MIUI/HyperOS 会过滤第三方应用的 INFO 日志）＋ XposedBridge 日志。 */
+    static void logCat(String msg) {
+        try {
+            android.util.Log.w("TbuluAdFree", msg);
+        } catch (Throwable ignored) {
+        }
+        XposedInit.log(msg);
+    }
 
     private static Class<?> findClassSafe(ClassLoader cl, String name) {
         try {

@@ -47,5 +47,7 @@
     <string name="switch_share_logo_summary">隐藏打卡/累计预览图右上角的两步路水印</string>
 
     <string name="settings_hint_title">使用说明</string>
-    <string name="settings_hint">请打开两步路APP，在我的-左上角菜单里即可看到模块设置。\n\n修改设置后，重启两步路APP后生效\n\n首次使用请先打开一次本界面生成配置文件；如果未生效，请确保已在 LSPosed 里启用本模块且作用域勾选了“两步路”APP，然后重启两步路。\n\n本模块开源地址：https://github.com/sumver/hooktbulu\n失效、BUG等前往以上项目提issue。</string>
+    <string name="settings_hint">请打开两步路APP，在我的-左上角菜单里即可看到模块设置。\n\n修改设置后，重启两步路APP后生效\n\n首次使用请先打开一次本界面生成配置文件；如果未生效，请确保已在 LSPosed 里启用本模块且作用域勾选了“两步路”APP，然后重启两步路。\n\n⚠️ 重要：本模块的开关通过本应用提供给两步路读取。MIUI / HyperOS 默认会以“自启动”名义拦截这种跨应用读取，表现为「弹窗里改了开关但不生效」。请到 系统设置 → 应用设置 → 应用管理 → 两步路去广告 → 自启动 / 后台运行 里放行本应用（或加入电池优化白名单）。
+
+本模块开源地址：https://github.com/sumver/hooktbulu\n失效、BUG等前往以上项目提issue。</string>
 </resources>
